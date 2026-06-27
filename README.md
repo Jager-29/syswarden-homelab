@@ -2,7 +2,7 @@
 
 Documentation de l'intégration de [SysWarden](https://github.com/duggytuxy/syswarden) sur mon infrastructure homelab auto-hébergée. Ce dépôt ne contient pas le code source de SysWarden — il documente ma configuration de déploiement, les décisions d'intégration et la coexistence avec la stack existante.
 
-> Basé sur SysWarden v0.39.x par [@duggytuxy](https://github.com/duggytuxy) — licence GPLv3.
+> Basé sur SysWarden v3.10.2 par [@duggytuxy](https://github.com/duggytuxy) — licence GPLv3.
 
 ## Contexte
 
@@ -17,7 +17,7 @@ Internet
 [ SysWarden — couche hôte ]
    ├── L2/L3 ingress (NIC) : blocklists GeoIP + ASN + Data-Shield → drop avant conntrack
    ├── L4 stateful         : purification TCP, Default-Deny catch-all
-   └── L7 HIPS (Fail2ban)  : 56+ jails sur services système (SSH, etc.)
+   └── L7 WAF (Go engine)  : signatures MITRE ATT&CK, UDS socket, telemetry
    │
    ▼
 [ nftables — pare-feu noyau ]
@@ -26,7 +26,7 @@ Internet
 [ CrowdSec — couche applicative ]
    ├── Analyse logs NPM (conteneur)
    ├── Analyse logs Cowrie (honeypot)
-   └── Bans comportementaux → ipset / nftables
+   └── Bans comportementaux → nftables
    │
    ▼
 [ Stack Docker — securehomelab ]
@@ -36,114 +36,167 @@ Internet
    └── Grafana / Prometheus (monitoring)
 ```
 
-Les deux systèmes écrivent dans nftables sur des **tables distinctes** : SysWarden opère dans `syswarden_table` sur le hook `netdev` (ingress NIC), CrowdSec opère dans ses propres chaînes sur le hook `input`. Aucun conflit d'écriture possible.
+Les deux systèmes écrivent dans nftables sur des **tables distinctes** : SysWarden opère dans `syswarden_hw_drop` sur le hook `netdev` (ingress NIC), CrowdSec opère dans `CROWDSEC_CHAIN` sur le hook `input`. Aucun conflit d'écriture possible.
 
-## Décisions de déploiement
+## Spécificité ARM64 — Compilation manuelle
 
-### CrowdSec + Fail2ban : périmètres séparés
-
-SysWarden active automatiquement des jails Fail2ban pour les services détectés en écoute. Comme CrowdSec couvre déjà les services Docker (NPM, Cowrie), il y a un risque de double détection. La règle appliquée :
-
-- Fail2ban de SysWarden : services **hôte** uniquement (SSH système, journald, kernel).
-- CrowdSec : services **conteneurisés** (NPM, Cowrie, HTTP).
-
-Pas de désactivation manuelle nécessaire — SysWarden scanne les services en écoute et n'active que les jails pertinentes. SSH système est sur un port non-standard, ce qui réduit naturellement le bruit.
-
-### Docker : whitelisting des réseaux internes
-
-`SYSWARDEN_USE_DOCKER="y"` est impératif. Sans ça, les règles Default-Deny de SysWarden bloquent le trafic inter-conteneurs sur les bridges Docker (`172.16.0.0/12`). SysWarden détecte automatiquement les interfaces `docker0` et les réseaux actifs et les exclut de ses règles de filtrage.
-
-### GeoIP : liste ciblée, pas totale
-
-Le géoblocage est activé sur les pays les plus représentés dans les logs du honeypot et les décisions CrowdSec, pas sur une liste exhaustive qui produirait des faux positifs. La liste est revue manuellement à chaque mise à jour des stats Metabase.
-
-### WireGuard : accès admin cloisonné
-
-SSH système n'écoute plus que sur l'interface `wg0` après activation de WireGuard. L'administration de l'hôte passe uniquement par le tunnel VPN — le port SSH physique n'est plus exposé publiquement. Le port WireGuard `:51820` reste ouvert sur l'IP publique.
-
-## Installation
+Les releases officielles de SysWarden v3 ne fournissent que des binaires `amd64`. Cette infra tourne sur **Freebox Ultra (aarch64 / ARM64)** — les binaires doivent être compilés depuis les sources.
 
 ### Prérequis
 
-- Debian 12 Bookworm (ARM64 — Freebox Ultra)
+- Debian 12+ / Ubuntu 24.04+ (ARM64)
+- Go 1.22+ (`apt install golang-go`)
+- Git (`apt install git`)
 - Accès root
-- Stack Docker active ([securehomelab](https://github.com/Jager-29/securehomelab) déployée)
-- GitHub CLI `gh` si vérification de l'attestation souhaitée
 
-### 1. Télécharger et vérifier SysWarden
+### Compilation des binaires ARM64
 
 ```bash
-# Télécharger le paquet .deb et son checksum depuis les releases officielles
-wget https://github.com/duggytuxy/syswarden/releases/download/v0.39.3/syswarden_0.39.3_all.deb
-wget https://github.com/duggytuxy/syswarden/releases/download/v0.39.3/SHA256SUMS.txt
+# Cloner les sources
+cd /usr/local/bin
+git clone https://github.com/duggytuxy/syswarden.git
+cd syswarden
 
-# Vérifier l'intégrité
-sha256sum -c SHA256SUMS.txt --ignore-missing
+# Forcer la compilation ARM64 (le build.sh officiel cible amd64 en dur)
+export GOOS=linux
+export GOARCH=arm64
+mkdir -p dist/bin
+
+# Compiler les trois modules
+cd src/core/syswarden-cli
+go mod tidy && go build -ldflags="-s -w" -o ../../../dist/bin/syswarden-cli .
+cd ../syswarden-core
+go mod tidy && go build -ldflags="-s -w" -o ../../../dist/bin/syswarden-core .
+cd ../syswarden-tui
+go mod tidy && go build -ldflags="-s -w" -o ../../../dist/bin/syswarden-tui .
+
+# Vérifier l'architecture des binaires produits
+file /usr/local/bin/syswarden/dist/bin/*
+# -> ELF 64-bit LSB executable, ARM aarch64 ✓
 ```
 
-Pour les environnements qui exigent une vérification de la chaîne d'approvisionnement :
+### Installation des binaires
 
 ```bash
-gh attestation verify syswarden_0.39.3_all.deb --owner duggytuxy
+# Copier dans /usr/local/bin pour le PATH
+cp /usr/local/bin/syswarden/dist/bin/* /usr/local/bin/
+chmod +x /usr/local/bin/syswarden-cli /usr/local/bin/syswarden-core /usr/local/bin/syswarden-tui
+
+# Créer le symlink syswarden -> syswarden-cli
+ln -s /usr/local/bin/syswarden-cli /usr/local/bin/syswarden
+
+# Créer le dossier attendu par le service systemd
+mkdir -p /opt/syswarden/bin
+cp /usr/local/bin/syswarden/dist/bin/* /opt/syswarden/bin/
+chmod +x /opt/syswarden/bin/*
 ```
 
-### 2. Installer le paquet
+## Déploiement
+
+### 1. Préparer la configuration
 
 ```bash
-apt-get install -y ./syswarden_0.39.3_all.deb
-```
-
-### 3. Déployer la configuration
-
-Copier le fichier de configuration de ce dépôt vers le chemin attendu par SysWarden :
-
-```bash
-# Éditer les variables sensibles avant de copier (IP admin, clé AbuseIPDB)
+mkdir -p /opt/syswarden
 cp syswarden-auto.conf /opt/syswarden/syswarden-auto.conf
 chmod 600 /opt/syswarden/syswarden-auto.conf
 
-# Lancer l'installation non interactive
-syswarden /opt/syswarden/syswarden-auto.conf
+# Renseigner les variables sensibles
+nano /opt/syswarden/syswarden-auto.conf
+# -> SYSWARDEN_SSH_PORT, SYSWARDEN_WHITELIST_IPS
+```
+
+### 2. Lancer l'installation
+
+```bash
+/usr/local/bin/syswarden-cli install
+```
+
+### 3. Corriger le signatures.json (spécificité ARM64)
+
+Le service `syswarden-core` requiert `/opt/syswarden/signatures.json` — non généré par l'installeur en mode compilation manuelle. L'extraire depuis l'archive de release :
+
+```bash
+wget https://github.com/duggytuxy/syswarden/releases/latest/download/syswarden-release.tar.gz
+tar -xzOf syswarden-release.tar.gz ./signatures.json > /opt/syswarden/signatures.json
+rm syswarden-release.tar.gz
+
+systemctl restart syswarden-core
+systemctl is-active syswarden-core   # -> active
 ```
 
 ### 4. Vérifier le déploiement
 
 ```bash
-# Vérifier que la table SysWarden est active dans nftables
-nft list ruleset | grep syswarden_table
-
-# Vérifier que les jails Fail2ban sont actives
-fail2ban-client status
-
-# Vérifier que les tables CrowdSec sont toujours intactes
-nft list ruleset | grep crowdsec
-
-# S'assurer que les conteneurs Docker communiquent toujours
-docker compose -f /path/to/securehomelab/docker-compose.yaml ps
+/opt/syswarden/bin/syswarden-cli audit
 ```
 
-### 5. Vérifier WireGuard (si activé)
+Résultat obtenu sur cette infra (7/7 PASS) :
 
-```bash
-wg show
-# Vérifier l'accès SSH via le tunnel avant de fermer la session courante
-ssh -p <port> user@<wg_ip>
+```
+Phase 1 : Cron Orchestration              [PASS]
+Phase 2 : Log Routing & Anti-Injection    [PASS]
+Phase 3 : Kernel Shield & Threat Intel    [PASS] (GeoIP + ASN + Data-Shield + Docker)
+Phase 4 : Layer 7 WAF                     [PASS]
+Phase 5 : DevSecOps Telemetry             [PASS]
+Phase 6 : WireGuard                       [INFO] Disabled
+Phase 7 : CSPM / Persistence              [PASS]
 ```
 
-## Mises à jour
+## Décisions de déploiement
 
-SysWarden se met à jour via le paquet `.deb`. Vérifier les releases upstream avant chaque mise à jour, notamment le changelog des règles Fail2ban et des changements de tables nftables qui pourraient impacter la coexistence avec CrowdSec.
+### CrowdSec + WAF SysWarden : périmètres séparés
+
+SysWarden WAF analyse les logs système via UDS socket. CrowdSec couvre les services conteneurisés (NPM, Cowrie). Les deux opèrent sur des surfaces distinctes sans conflit.
+
+### Docker : whitelisting automatique
+
+`SYSWARDEN_USE_DOCKER="y"` permet à SysWarden de détecter et whitelister automatiquement tous les bridges Docker actifs. Sur cette infra, 7 bridges ont été whitelistés automatiquement à l'installation.
+
+### GeoIP : liste ciblée
+
+Le géoblocage est calibré sur les pays les plus représentés dans les logs Metabase/CrowdSec — pas une liste exhaustive pour éviter les faux positifs.
+
+### WireGuard : désactivé pour ce déploiement de test
+
+`SYSWARDEN_ENABLE_WG="n"` — à activer sur l'infra de production pour cloisonner l'accès SSH derrière un tunnel VPN.
+
+## Commandes utiles
 
 ```bash
-# Vérifier la version installée
-syswarden --version
+# Dashboard TUI temps réel
+/opt/syswarden/bin/syswarden-tui
 
-# Mettre à jour (remplacer la version)
-wget https://github.com/duggytuxy/syswarden/releases/latest/download/SHA256SUMS.txt
-# ... puis répéter les étapes 1 à 3
+# Audit complet
+/opt/syswarden/bin/syswarden-cli audit
+
+# Bloquer une IP manuellement
+/opt/syswarden/bin/syswarden-cli block <IP>
+
+# Whitelister une IP
+/opt/syswarden/bin/syswarden-cli whitelist <IP>
+
+# Mettre à jour les feeds de threat intelligence
+/opt/syswarden/bin/syswarden-cli update-feeds
+
+# Voir les tables nftables SysWarden
+nft list ruleset | grep syswarden
+```
+
+## Mise à jour
+
+SysWarden v3 étant en Go, une mise à jour = recompilation depuis les sources :
+
+```bash
+cd /usr/local/bin/syswarden
+git pull origin main
+export GOOS=linux GOARCH=arm64
+# Recompiler les trois modules (voir section compilation)
+cp dist/bin/* /opt/syswarden/bin/
+cp dist/bin/* /usr/local/bin/
+systemctl restart syswarden-core
 ```
 
 ## Licence
 
 Ce dépôt (documentation et configuration) est sous licence MIT.
-SysWarden lui-même est distribué sous [GPLv3](https://github.com/duggytuxy/syswarden/blob/main/LICENSE) par [@duggytuxy](https://github.com/duggytuxy).
+SysWarden est distribué sous [GPLv3](https://github.com/duggytuxy/syswarden/blob/main/LICENSE) par [@duggytuxy](https://github.com/duggytuxy).
