@@ -1,139 +1,149 @@
-# Secure & Monitored Homelab Infrastructure
+# SysWarden — Déploiement Homelab
 
-Ce projet documente la mise en place d'une infrastructure de homelab auto-hébergée, robuste et sécurisée. L'objectif est de déployer des services conteneurisés tout en garantissant une haute sécurité (IPS/IDS), une défense active, une observabilité complète (monitoring, alerting, BI) et une stratégie de sauvegarde résiliente.
+Documentation de l'intégration de [SysWarden](https://github.com/duggytuxy/syswarden) sur mon infrastructure homelab auto-hébergée. Ce dépôt ne contient pas le code source de SysWarden — il documente ma configuration de déploiement, les décisions d'intégration et la coexistence avec la stack existante.
 
-## Architecture
+> Basé sur SysWarden v0.39.x par [@duggytuxy](https://github.com/duggytuxy) — licence GPLv3.
 
-![Architecture du homelab](architecture.svg)
+## Contexte
 
-<sub>Icônes : [Simple Icons](https://simpleicons.org) (CC0) et [Lucide](https://lucide.dev) (ISC).</sub>
+Ce déploiement s'inscrit dans une infrastructure plus large documentée dans [securehomelab](https://github.com/Jager-29/securehomelab). SysWarden y prend en charge la couche de défense réseau bas niveau (L2/L3/L4) sur l'hôte Debian, en complément de CrowdSec qui opère sur la couche applicative (L7) via les logs des conteneurs Docker.
 
-## Stack technique
+### Architecture de défense en profondeur
 
-| Domaine | Composant | Rôle |
-| --- | --- | --- |
-| Infrastructure hôte | Freebox Ultra | Support VM ARM64 / Debian Bookworm |
-| Conteneurisation | Docker Engine & Docker Compose | Déploiement unifié et reproductible |
-| Orchestration | Portainer CE | Gestion graphique des stacks |
-| Reverse proxy & SSL | Nginx Proxy Manager | Gestion automatique des certificats Let's Encrypt |
-| Sécurité hôte (HIPS) | SysWarden | Défense réseau L2/L3/L4 au niveau du noyau — [repo dédié](https://github.com/Jager-29/syswarden-homelab) |
-| Sécurité défensive (IPS/IDS) | CrowdSec | Agent d'analyse + bouncer pare-feu `nftables` |
-| Défense active (honeypot) | Cowrie | Pot de miel SSH/Telnet haute interaction |
-| Monitoring technique | Prometheus, Grafana, cAdvisor, Node Exporter | Métriques système et conteneurs |
-| Business Intelligence | Metabase | Cartographie des menaces (connecté à la base CrowdSec) |
-| Disponibilité | Uptime Kuma | Monitoring HTTP/TCP/DNS externe |
-| Sauvegarde & résilience | Duplicati | Stratégie 3-2-1 avec chiffrement |
-| Alerting | Discord Webhooks | Notifications centralisées en temps réel |
+```
+Internet
+   │
+   ▼
+[ SysWarden — couche hôte ]
+   ├── L2/L3 ingress (NIC) : blocklists GeoIP + ASN + Data-Shield → drop avant conntrack
+   ├── L4 stateful         : purification TCP, Default-Deny catch-all
+   └── L7 HIPS (Fail2ban)  : 56+ jails sur services système (SSH, etc.)
+   │
+   ▼
+[ nftables — pare-feu noyau ]
+   │
+   ▼
+[ CrowdSec — couche applicative ]
+   ├── Analyse logs NPM (conteneur)
+   ├── Analyse logs Cowrie (honeypot)
+   └── Bans comportementaux → ipset / nftables
+   │
+   ▼
+[ Stack Docker — securehomelab ]
+   ├── Nginx Proxy Manager  (reverse proxy / SSL)
+   ├── Cowrie               (honeypot SSH :2222)
+   ├── Metabase             (threat intel BI)
+   └── Grafana / Prometheus (monitoring)
+```
 
-## Focus sécurité et défense active
+Les deux systèmes écrivent dans nftables sur des **tables distinctes** : SysWarden opère dans `syswarden_table` sur le hook `netdev` (ingress NIC), CrowdSec opère dans ses propres chaînes sur le hook `input`. Aucun conflit d'écriture possible.
 
-La sécurité est le cœur de cette infrastructure, qui passe d'une posture passive à une défense proactive.
+## Décisions de déploiement
 
-- **Défense réseau bas niveau (SysWarden)** : une couche HIPS opère directement sur l'hôte Debian, en dessous de Docker. Elle gère le filtrage L2/L3 au niveau de la carte réseau (GeoIP, ASN, blocklists), la purification TCP stateful et les jails Fail2ban pour les services système. Détails dans le [repo dédié](https://github.com/Jager-29/syswarden-homelab).
+### CrowdSec + Fail2ban : périmètres séparés
 
-- **Analyse comportementale** : CrowdSec analyse en temps réel les logs de Nginx Proxy Manager et du système pour détecter les patterns d'attaques connus.
-- **Honeypot SSH (Cowrie)** : un leurre est déployé sur un port secondaire (2222, redirigé depuis l'extérieur). Il simule un serveur vulnérable pour attirer les bots, enregistrer leurs commandes et détourner les attaques brute-force du véritable service SSH.
-- **Stratégie « Sniper »** : un scénario CrowdSec ultra-agressif est appliqué spécifiquement aux logs du honeypot.
-  - *Tolérance zéro* : bannissement immédiat et long (48 h) dès la 2e tentative d'intrusion échouée sur le pot de miel.
-  - *Mémoire longue* : les tentatives sont mémorisées pendant 10 h, ce qui empêche d'échapper au ban en ralentissant la cadence de l'attaque.
-- **Remédiation automatique** : le bouncer CrowdSec applique les bannissements directement au niveau du pare-feu du noyau Linux (`ipset` / `nftables`), bloquant l'IP avant même qu'elle n'atteigne les applications.
-- **Gestion des accès** : whitelisting strict des IP locales et de confiance pour éviter les auto-bans.
+SysWarden active automatiquement des jails Fail2ban pour les services détectés en écoute. Comme CrowdSec couvre déjà les services Docker (NPM, Cowrie), il y a un risque de double détection. La règle appliquée :
 
-## Observabilité et threat intel
+- Fail2ban de SysWarden : services **hôte** uniquement (SSH système, journald, kernel).
+- CrowdSec : services **conteneurisés** (NPM, Cowrie, HTTP).
 
-Une stack complète surveille la santé du système et transforme les logs de sécurité en renseignement exploitable.
+Pas de désactivation manuelle nécessaire — SysWarden scanne les services en écoute et n'active que les jails pertinentes. SSH système est sur un port non-standard, ce qui réduit naturellement le bruit.
 
-- **Prometheus** : collecte centrale des métriques système (CPU, RAM, I/O disque, réseau) et des performances Docker.
-- **Grafana** : visualisation des données techniques via des dashboards personnalisés pour l'état de santé de l'hôte et des conteneurs.
-- **Metabase (centre de threat intel)** : connecté en lecture seule à la base SQLite de CrowdSec, il sert de centre de commandement.
-  - Cartographie mondiale des attaques bloquées en temps réel.
-  - Identification des principaux pays, ASN et scénarios d'attaques les plus agressifs.
-  - Analyse forensique de l'historique des tentatives d'intrusion.
-- **Uptime Kuma** : surveille la disponibilité des services HTTP/TCP depuis l'extérieur et alerte instantanément via Discord en cas de downtime (vérification du bon fonctionnement du reverse proxy).
+### Docker : whitelisting des réseaux internes
 
-## Stratégie de sauvegarde
+`SYSWARDEN_USE_DOCKER="y"` est impératif. Sans ça, les règles Default-Deny de SysWarden bloquent le trafic inter-conteneurs sur les bridges Docker (`172.16.0.0/12`). SysWarden détecte automatiquement les interfaces `docker0` et les réseaux actifs et les exclut de ses règles de filtrage.
 
-Pour garantir la pérennité des données, une stratégie de sauvegarde suivant la règle **3-2-1** est mise en place avec **Duplicati**.
+### GeoIP : liste ciblée, pas totale
 
-- **Trois copies des données** : données « live » sur le serveur, plus deux sauvegardes.
-- **Deux supports différents** :
-  - Copie locale rapide (NAS local ou support USB attaché à la Freebox).
-  - Copie distante (API cloud : S3, Backblaze B2 ou autre stockage compatible).
-- **Une copie hors site** : la sauvegarde cloud garantit la survie des données en cas de sinistre physique (incendie, vol de la Freebox).
-- **Sécurité des sauvegardes** : toutes les sauvegardes sortantes sont chiffrées en AES-256 par Duplicati avant l'envoi.
+Le géoblocage est activé sur les pays les plus représentés dans les logs du honeypot et les décisions CrowdSec, pas sur une liste exhaustive qui produirait des faux positifs. La liste est revue manuellement à chaque mise à jour des stats Metabase.
+
+### WireGuard : accès admin cloisonné
+
+SSH système n'écoute plus que sur l'interface `wg0` après activation de WireGuard. L'administration de l'hôte passe uniquement par le tunnel VPN — le port SSH physique n'est plus exposé publiquement. Le port WireGuard `:51820` reste ouvert sur l'IP publique.
 
 ## Installation
 
-Ce projet utilise `docker-compose` pour un déploiement unifié et reproductible.
+### Prérequis
 
-1. Cloner le dépôt :
+- Debian 12 Bookworm (ARM64 — Freebox Ultra)
+- Accès root
+- Stack Docker active ([securehomelab](https://github.com/Jager-29/securehomelab) déployée)
+- GitHub CLI `gh` si vérification de l'attestation souhaitée
 
-   ```bash
-   git clone https://github.com/Jager-29/securehomelab.git
-   cd securehomelab
-   ```
-
-2. Configurer l'environnement. Créez le fichier `.env` à partir de l'exemple, puis modifiez les mots de passe :
-
-   ```bash
-   cp .env.example .env
-   nano .env
-   ```
-
-   Définissez des mots de passe forts pour `NPM_DB_PASSWORD` et `GRAFANA_PASSWORD`.
-
-3. Préparer les dossiers. Créez les répertoires nécessaires pour éviter les problèmes de permission au démarrage (notamment pour le honeypot et Metabase) :
-
-   ```bash
-   mkdir -p cowrie/var/log/cowrie
-   mkdir -p cowrie/etc
-   mkdir -p metabase-data
-   mkdir -p duplicati/config
-   ```
-
-4. Démarrer la stack en mode détaché :
-
-   ```bash
-   docker compose up -d
-   ```
-
-5. Corriger les permissions (nécessaire pour Metabase). Une fois CrowdSec démarré, il crée sa base de données SQLite. Donnez les droits de lecture à Metabase pour que le dashboard fonctionne :
-
-   ```bash
-   # Autoriser la lecture de la base CrowdSec par les autres conteneurs
-   sudo chmod 644 crowdsec/db/crowdsec.db
-   # Redémarrer Metabase pour qu'il prenne en compte le changement
-   docker restart metabase
-   ```
-
-## Accès aux services
-
-Une fois déployé, voici les ports d'accès par défaut (à configurer via Nginx Proxy Manager pour un accès externe sécurisé).
-
-| Service | Port local | URL locale | Identifiants par défaut |
-| --- | --- | --- | --- |
-| Nginx Proxy Manager | 81 | `http://IP_LOCALE:81` | `admin@example.com` / `changeme` |
-| Grafana | 3000 | `http://IP_LOCALE:3000` | `admin` / (valeur du `.env`) |
-| Uptime Kuma | 3001 | `http://IP_LOCALE:3001` | Création de compte au 1er lancement |
-| Metabase (BI) | 3008 | `http://IP_LOCALE:3008` | Setup au 1er lancement |
-| Duplicati (backup) | 8200 | `http://IP_LOCALE:8200` | Pas de mot de passe par défaut |
-| Cowrie (honeypot) | 2222 | Port SSH leurre | Ne pas exposer l'interface, c'est un piège |
-
-## Configuration initiale requise
-
-**Nginx Proxy Manager** : connectez-vous, changez les identifiants admin, puis créez vos Proxy Hosts.
-
-**CrowdSec** : le bouncer est déjà configuré. Vous pouvez gérer les décisions via :
+### 1. Télécharger et vérifier SysWarden
 
 ```bash
-docker exec -it crowdsec cscli decisions list
+# Télécharger le paquet .deb et son checksum depuis les releases officielles
+wget https://github.com/duggytuxy/syswarden/releases/download/v0.39.3/syswarden_0.39.3_all.deb
+wget https://github.com/duggytuxy/syswarden/releases/download/v0.39.3/SHA256SUMS.txt
+
+# Vérifier l'intégrité
+sha256sum -c SHA256SUMS.txt --ignore-missing
 ```
 
-**Metabase** : ajoutez la base de données CrowdSec.
+Pour les environnements qui exigent une vérification de la chaîne d'approvisionnement :
 
-- Type : SQLite.
-- Chemin du fichier : `/crowdsec-db/crowdsec.db` (chemin interne au conteneur).
+```bash
+gh attestation verify syswarden_0.39.3_all.deb --owner duggytuxy
+```
+
+### 2. Installer le paquet
+
+```bash
+apt-get install -y ./syswarden_0.39.3_all.deb
+```
+
+### 3. Déployer la configuration
+
+Copier le fichier de configuration de ce dépôt vers le chemin attendu par SysWarden :
+
+```bash
+# Éditer les variables sensibles avant de copier (IP admin, clé AbuseIPDB)
+cp syswarden-auto.conf /opt/syswarden/syswarden-auto.conf
+chmod 600 /opt/syswarden/syswarden-auto.conf
+
+# Lancer l'installation non interactive
+syswarden /opt/syswarden/syswarden-auto.conf
+```
+
+### 4. Vérifier le déploiement
+
+```bash
+# Vérifier que la table SysWarden est active dans nftables
+nft list ruleset | grep syswarden_table
+
+# Vérifier que les jails Fail2ban sont actives
+fail2ban-client status
+
+# Vérifier que les tables CrowdSec sont toujours intactes
+nft list ruleset | grep crowdsec
+
+# S'assurer que les conteneurs Docker communiquent toujours
+docker compose -f /path/to/securehomelab/docker-compose.yaml ps
+```
+
+### 5. Vérifier WireGuard (si activé)
+
+```bash
+wg show
+# Vérifier l'accès SSH via le tunnel avant de fermer la session courante
+ssh -p <port> user@<wg_ip>
+```
+
+## Mises à jour
+
+SysWarden se met à jour via le paquet `.deb`. Vérifier les releases upstream avant chaque mise à jour, notamment le changelog des règles Fail2ban et des changements de tables nftables qui pourraient impacter la coexistence avec CrowdSec.
+
+```bash
+# Vérifier la version installée
+syswarden --version
+
+# Mettre à jour (remplacer la version)
+wget https://github.com/duggytuxy/syswarden/releases/latest/download/SHA256SUMS.txt
+# ... puis répéter les étapes 1 à 3
+```
 
 ## Licence
 
-Distribué sous licence MIT. Voir le fichier [LICENSE](LICENSE) pour plus de détails.
+Ce dépôt (documentation et configuration) est sous licence MIT.
+SysWarden lui-même est distribué sous [GPLv3](https://github.com/duggytuxy/syswarden/blob/main/LICENSE) par [@duggytuxy](https://github.com/duggytuxy).
