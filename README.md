@@ -38,9 +38,9 @@ Internet
 
 Les deux systèmes écrivent dans nftables sur des **tables distinctes** : SysWarden opère dans `syswarden_hw_drop` sur le hook `netdev` (ingress NIC), CrowdSec opère dans `CROWDSEC_CHAIN` sur le hook `input`. Aucun conflit d'écriture possible.
 
-## Spécificité ARM64 — Compilation manuelle
+## Spécificité ARM64 - Compilation manuelle
 
-Les releases officielles de SysWarden v3 ne fournissent que des binaires `amd64`. Cette infra tourne sur **Freebox Ultra (aarch64 / ARM64)** — les binaires doivent être compilés depuis les sources.
+Les releases officielles de SysWarden v3 ne fournissent que des binaires `amd64`. Cette infra tourne sur **Freebox Ultra (aarch64 / ARM64)** - les binaires doivent être compilés depuis les sources.
 
 ### Prérequis
 
@@ -158,7 +158,7 @@ Le géoblocage est calibré sur les pays les plus représentés dans les logs Me
 
 ### WireGuard : désactivé pour ce déploiement de test
 
-`SYSWARDEN_ENABLE_WG="n"` — à activer sur l'infra de production pour cloisonner l'accès SSH derrière un tunnel VPN.
+`SYSWARDEN_ENABLE_WG="n"` - à activer sur l'infra de production pour cloisonner l'accès SSH derrière un tunnel VPN.
 
 ## Commandes utiles
 
