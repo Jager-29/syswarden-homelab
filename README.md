@@ -1,6 +1,6 @@
-# SysWarden — Déploiement Homelab
+# SysWarden - Déploiement Homelab
 
-Documentation de l'intégration de [SysWarden](https://github.com/duggytuxy/syswarden) sur mon infrastructure homelab auto-hébergée. Ce dépôt ne contient pas le code source de SysWarden — il documente ma configuration de déploiement, les décisions d'intégration et la coexistence avec la stack existante.
+Documentation de l'intégration de [SysWarden](https://github.com/duggytuxy/syswarden) sur mon infrastructure homelab auto-hébergée. Ce dépôt ne contient pas le code source de SysWarden - il documente ma configuration de déploiement, les décisions d'intégration et la coexistence avec la stack existante.
 
 > Basé sur SysWarden v3.10.2 par [@duggytuxy](https://github.com/duggytuxy) — licence GPLv3.
 
